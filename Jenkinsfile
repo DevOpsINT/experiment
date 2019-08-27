@@ -1,66 +1,99 @@
 pipeline {
+    options {
+        timeout(time: 10, unit: 'MINUTES')
+    }
+    agent {
+        label 'master'
     agent{
         label 'slave'
     }
-    
+
     stages {
+        stage('Checkout') {
         stage ('checkout'){
             steps {
-                script{
-                dir('development'){
-                deleteDir()
-                checkout([$class: 'GitSCM', branches: [[name: '*/Dev']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'b6218c54-9fe9-4052-8da9-58322b94e248', url: 'https://github.com/JohnMops/CI-CD-Project']]])
-                sh "git fetch --all"
-                CurrentVersion = sh script: "git branch -r | cut -d'/' -f2 | grep -v -e master -e HEAD -e Dev | sort -r | head -1", returnStdout: true
-                CurrentVersion = CurrentVersion.trim()
-                nextVersion = CurrentVersion + 1
-                commitIDshort = sh script:"git rev-parse HEAD | cut -c1-10", returnStdout: true
-                commitIDshort = commitIDshort.trim()
-                BuildVersion = "${CurrentVersion}_${commitIDshort}"
-                }
-                }
-            }
-        }
-        stage ('Build Image and Sanity Test'){
-            steps {
-                script{
-                    dir ('development') {
-                    myImage = docker.build("johnmops/python-app:${nextVersion}", "./app")
-                    myImage.withRun('-p 80:80 --name python') {c ->
-                      try{
-                          sh 'sleep 1'
-                          sh 'curl -i -m 1 http://localhost'
-                      } catch (err) {
-                          currentBuild.result = 'FAILED'
-                          
-                      }
+                script {
+                    dir('release') {
+                        deleteDir()
+                        checkout([$class: 'GitSCM', branches: [[name: '*/development']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'DevOpsINT', url: 'https://github.com/DevOpsINT/release.git']]])    
                     }
-                }
+                    dir('experiment') {
+                        deleteDir()
+                        checkout([$class: 'GitSCM', branches: [[name: '*/development']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'DevOpsINT', url: 'https://github.com/DevOpsINT/experiment.git']]])                    
+                        sh "git fetch --all"
+                        CurrentVersion = sh script: "git branch -r | cut -d'/' -f2 | grep -v -e master -e HEAD -e dev | sort -r | head -1", returnStdout: true
+                        CurrentVersion = CurrentVersion.trim()
+                        // to fix next version
+                        nextVersion = CurrentVersion + 1
+                        commitIDshort = sh script:"git rev-parse HEAD | cut -c1-10", returnStdout: true
+                        commitIDshort = commitIDshort.trim()
+                        BuildVersion = "${CurrentVersion}_${commitIDshort}"
+                        println("Current version is ${CurrentVersion}")
+                        println("nextVersion is ${nextVersion}")
+                        print("BuildVersion is ${BuildVersion}")
+                    }
+            }
+        }
+        stage('Unit Test') {
+            steps {
+                script {
+                    dir('experiment') {
+                        sh "python ExperimentTests.py"
+                        stash includes: '*', name: 'files', useDefaultExcludes: false
                 }
             }
         }
-        stage ('Push to Docker Hub') {
+        stage('Sanity Test') {
+        agent {
+            label 'docker'
+        }      
             steps {
                 script {
-                    docker.withRegistry('', 'b76ccfeb-b32d-41c0-b116-c85c72168576'){
-                        myImage.push()
-                }
+                    unstash 'files'
+                    try {
+                        sh "docker build . -t experiment:${nextVersion} &>/dev/null"
+                        sh "docker run -d --name experiment experiment:${nextVersion}"
+                        sh "docker logs experiment | grep Hello"
+                    } catch(err) {
+                        println("[ERROR] Failed on previous step ${err}")
+                        sh "if docker ps -a | grep experiment; then docker rm experiment -f; fi"
+                       currentBuild.result = 'FAILED'
+                    }
+                    sh "if docker ps -a | grep experiment; then docker rm experiment -f; fi"
                 }
             }
         }
-        stage ('Push to a new branch'){
+        stage('Tag and Upload') {
+        agent {
+            label 'docker'
+        }      
+            steps {
+                script {   
+                    sh "mkdir -p /mnt/artifacts/experiment/${nextVersion}"
+                    sh "docker save experiment:${nextVersion} -o /mnt/artifacts/experiment/${nextVersion}/experiment.tar"
+                }
+            }
+        }
+        stage('Create new Git Branch') {
             steps {
                 script {
+                    //withCredentials([usernamePassword(credentialsId: 'DevOpsINT', passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
+                    dir('experiment') {
                     dir ('development'){
                         withCredentials([usernamePassword(credentialsId: 'b6218c54-9fe9-4052-8da9-58322b94e248', 
                         passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
                         sh "git branch ${nextVersion}"
                         sh "git checkout ${nextVersion}"
-                        sh 'git push https://${GIT_USER}:${GIT_PASS}@github.com/JohnMops/CI-CD-Project'
+                        sh "git push https://DevOpsINT:\\!Devopsshoam2019@github.com/DevOpsINT/experiment.git"
                     }
+                    dir('release') {
+                        sh "sed -i 's/${CurrentVersion}/${nextVersion}/g' dev.json"
+                        sh "git config user.email 'devopsint@gmail.com'"
+                        sh "git checkout development"
+                        sh "git config user.name DevOpsINT"
+                        sh "git add dev.json"
+                        sh "git commit -m 'CI approved ${nextVersion}'"
+                        sh "git push https://DevOpsINT:\\!Devopsshoam2019@github.com/DevOpsINT/release.git"
                     }
                 }
             }
-        }
-    }
-}
